@@ -2,12 +2,8 @@ import os
 import asyncio
 import tempfile
 from pathlib import Path
-from collections import defaultdict
-from datetime import datetime
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -15,11 +11,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# =========================
-# 配置
-# =========================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -28,460 +20,291 @@ ADMIN_IDS = {
 
 COOLDOWN = int(os.getenv("COOLDOWN", "30"))
 MAX_RUNNING = int(os.getenv("MAX_RUNNING", "2"))
-
-# Render 自动提供这个变量
-PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-
-# 建议在 Render 自己设置
-WEBHOOK_SECRET = os.getenv(
-    "WEBHOOK_SECRET",
-    "sherlock-webhook-secret"
-)
-
-WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN 未设置")
+    raise RuntimeError("BOT_TOKEN is not configured")
 
-if not PUBLIC_URL:
-    raise RuntimeError(
-        "RENDER_EXTERNAL_URL 未设置，请手动设置 PUBLIC_URL"
-    )
+app = FastAPI()
+telegram_app = None
+semaphore = asyncio.Semaphore(MAX_RUNNING)
 
-
-# =========================
-# 状态
-# =========================
-
-last_query = defaultdict(lambda: datetime.min)
-running_users = set()
+user_last_search = {}
 running_count = 0
 
 
-# =========================
-# Telegram Application
-# =========================
-
-telegram_app = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .build()
-)
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-# =========================
-# /start
-# =========================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔎 Sherlock TG Bot\n\n"
-        "查询公开用户名在社交平台上的匹配情况。\n\n"
-        "使用：\n"
+        "🔎 Sherlock 用户名查询机器人\n\n"
+        "使用方法：\n"
         "/search 用户名\n\n"
         "例如：\n"
-        "/search test123\n\n"
-        "其他：\n"
-        "/help"
+        "/search sherlock\n\n"
+        "查询结果来自 Sherlock。"
     )
 
 
-# =========================
-# /help
-# =========================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 使用帮助\n\n"
-        "/search 用户名\n"
-        "查询一个用户名。\n\n"
-        "/stats\n"
-        "管理员查看运行状态。\n\n"
-        "⚠️ 一次只允许查询一个用户名。"
+        "/search 用户名 - 查询用户名\n"
+        "/stats - 查看机器人状态\n"
+        "/help - 查看帮助"
     )
 
 
-# =========================
-# Sherlock 查询
-# =========================
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🤖 Sherlock Bot\n\n"
+        f"当前运行：{running_count}/{MAX_RUNNING}\n"
+        f"查询冷却：{COOLDOWN} 秒"
+    )
 
-async def run_sherlock(
-    chat_id: int,
-    username: str,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running_count
-
-    running_count += 1
-
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🔎 开始查询\n\n"
-                f"👤 用户名：{username}\n\n"
-                f"⏳ Sherlock 正在检查，请稍候……"
-            ),
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-
-            output_file = Path(tmpdir) / "result.txt"
-
-            command = [
-                "sherlock",
-                username,
-                "--output",
-                str(output_file),
-                "--print-found",
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-
-            try:
-                stdout, _ = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=300,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"⏱ 查询超时\n\n"
-                        f"用户名：{username}"
-                    ),
-                )
-                return
-
-            console_output = stdout.decode(
-                "utf-8",
-                errors="ignore"
-            )
-
-            if output_file.exists():
-                result = output_file.read_text(
-                    encoding="utf-8",
-                    errors="ignore"
-                )
-            else:
-                result = console_output
-
-            result = result.strip()
-
-            if not result:
-                result = "没有找到结果。"
-
-            header = (
-                "🔎 Sherlock 查询完成\n\n"
-                f"👤 用户名：{username}\n\n"
-            )
-
-            # Telegram 单条消息限制
-            if len(header + result) <= 3900:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=header + result,
-                    disable_web_page_preview=True,
-                )
-
-            else:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"✅ 查询完成\n\n"
-                        f"👤 用户名：{username}\n"
-                        f"📄 完整结果已作为文件发送。"
-                    ),
-                )
-
-                with output_file.open("rb") as file:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=file,
-                        filename=f"{username}_sherlock.txt",
-                        caption="📄 Sherlock 完整结果",
-                    )
-
-    except Exception as e:
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "❌ 查询失败\n\n"
-                f"{type(e).__name__}: "
-                f"{str(e)[:500]}"
-            ),
-        )
-
-    finally:
-        running_count -= 1
-
-
-# =========================
-# /search
-# =========================
-
-async def search_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
 
     if not update.message:
         return
 
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
 
     if not context.args:
-
         await update.message.reply_text(
-            "❌ 请提供用户名。\n\n"
+            "❌ 请提供用户名\n\n"
             "例如：\n"
-            "/search test123"
-        )
-        return
-
-    if len(context.args) != 1:
-
-        await update.message.reply_text(
-            "❌ 一次只能查询一个用户名。"
+            "/search sherlock"
         )
         return
 
     username = context.args[0].strip()
 
-    # 基本过滤
     if len(username) > 100:
-
-        await update.message.reply_text(
-            "❌ 用户名太长。"
-        )
+        await update.message.reply_text("❌ 用户名不能超过 100 个字符")
         return
 
     if username.startswith("-"):
-
-        await update.message.reply_text(
-            "❌ 无效用户名。"
-        )
+        await update.message.reply_text("❌ 无效用户名")
         return
 
-    # 用户正在查询
-    if user_id in running_users:
+    # 管理员不受冷却限制
+    if user_id not in ADMIN_IDS:
+        now = asyncio.get_running_loop().time()
+        last = user_last_search.get(user_id, 0)
 
-        await update.message.reply_text(
-            "⏳ 你已经有一个查询正在进行。"
-        )
-        return
-
-    # 全局并发限制
-    if running_count >= MAX_RUNNING:
-
-        await update.message.reply_text(
-            "⏳ 当前查询人数较多，请稍后再试。"
-        )
-        return
-
-    # 普通用户限速
-    if not is_admin(user_id):
-
-        now = datetime.now()
-
-        elapsed = (
-            now - last_query[user_id]
-        ).total_seconds()
-
-        if elapsed < COOLDOWN:
-
-            remaining = int(
-                COOLDOWN - elapsed
-            )
-
+        if now - last < COOLDOWN:
+            remaining = int(COOLDOWN - (now - last)) + 1
             await update.message.reply_text(
-                f"⏳ 查询太频繁，请 {remaining} 秒后再试。"
+                f"⏳ 请 {remaining} 秒后再查询。"
             )
             return
 
-        last_query[user_id] = now
+        user_last_search[user_id] = now
 
-    running_users.add(user_id)
-
-    # 创建后台任务
-    async def worker():
-
-        try:
-            await run_sherlock(
-                update.effective_chat.id,
-                username,
-                context,
-            )
-        finally:
-            running_users.discard(user_id)
-
-    asyncio.create_task(worker())
-
-    await update.message.reply_text(
-        f"✅ 已加入查询队列\n\n"
-        f"👤 用户名：{username}\n\n"
-        f"🔎 Sherlock 正在处理……"
-    )
-
-
-# =========================
-# /stats
-# =========================
-
-async def stats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-
+    if semaphore.locked() and running_count >= MAX_RUNNING:
         await update.message.reply_text(
-            "❌ 无权限。"
+            "⏳ 当前查询任务较多，请稍后再试。"
         )
         return
 
     await update.message.reply_text(
-        "👑 Sherlock Bot 状态\n\n"
-        f"运行中的查询：{running_count}\n"
-        f"最大并发：{MAX_RUNNING}\n"
-        f"用户冷却：{COOLDOWN} 秒\n"
-        f"管理员：{len(ADMIN_IDS)}"
+        f"🔎 正在查询：`{username}`\n\n"
+        "⏳ Sherlock 正在检查各个平台，请稍候……",
+        parse_mode="Markdown",
+    )
+
+    asyncio.create_task(
+        run_search(update, username)
     )
 
 
-# =========================
-# 注册命令
-# =========================
+async def run_search(update: Update, username: str):
+    global running_count
 
-telegram_app.add_handler(
-    CommandHandler("start", start)
-)
+    async with semaphore:
+        running_count += 1
 
-telegram_app.add_handler(
-    CommandHandler("help", help_command)
-)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_file = Path(temp_dir) / "result.txt"
 
-telegram_app.add_handler(
-    CommandHandler("search", search_command)
-)
+                command = [
+                    "sherlock",
+                    username,
+                    "--output",
+                    str(output_file),
+                    "--print-found",
+                ]
 
-telegram_app.add_handler(
-    CommandHandler("stats", stats_command)
-)
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
 
+                try:
+                    stdout, _ = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=300,
+                    )
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.communicate()
 
-# =========================
-# FastAPI
-# =========================
+                    await update.message.reply_text(
+                        "⏰ 查询超时，Sherlock 本次运行超过 5 分钟。"
+                    )
+                    return
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+                text = stdout.decode(
+                    "utf-8",
+                    errors="ignore"
+                ).strip()
 
-    await telegram_app.initialize()
-    await telegram_app.start()
+                if output_file.exists():
+                    file_text = output_file.read_text(
+                        encoding="utf-8",
+                        errors="ignore"
+                    ).strip()
 
-    webhook_url = (
-        PUBLIC_URL +
-        WEBHOOK_PATH
-    )
+                    if file_text:
+                        text = file_text
 
-    await telegram_app.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=[
-            "message"
-        ],
-    )
+                if not text:
+                    text = "没有获得查询结果。"
 
-    print(
-        "Telegram webhook:",
-        webhook_url
-    )
+                header = (
+                    f"🔎 Sherlock 查询结果\n"
+                    f"👤 用户名：{username}\n\n"
+                )
 
-    yield
+                result = header + text
 
-    await telegram_app.bot.delete_webhook()
-    await telegram_app.stop()
-    await telegram_app.shutdown()
+                if len(result) <= 3900:
+                    await update.message.reply_text(result)
+                else:
+                    result_file = Path(temp_dir) / f"{username}.txt"
+                    result_file.write_text(
+                        result,
+                        encoding="utf-8"
+                    )
 
+                    with result_file.open("rb") as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=f"{username}.txt",
+                            caption=f"🔎 {username} 查询结果",
+                        )
 
-app = FastAPI(
-    title="Sherlock Telegram Bot",
-    lifespan=lifespan,
-)
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ 查询失败：\n`{str(e)[:1000]}`",
+                parse_mode="Markdown",
+            )
 
+        finally:
+            running_count -= 1
 
-# =========================
-# 健康检查
-# =========================
 
 @app.get("/")
 async def root():
-
     return {
         "status": "ok",
-        "service": "sherlock-tgbot",
+        "service": "Sherlock Telegram Bot"
     }
 
 
 @app.get("/health")
 async def health():
-
     return {
         "status": "healthy",
         "running": running_count,
+        "max_running": MAX_RUNNING,
     }
 
 
-# =========================
-# Telegram Webhook
-# =========================
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    global telegram_app
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(
-    request: Request
-):
-
-    secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token"
-    )
-
-    if secret != WEBHOOK_SECRET:
-
-        raise HTTPException(
-            status_code=403,
-            detail="Forbidden",
+    if WEBHOOK_SECRET:
+        secret = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
         )
 
-    data = await request.json()
+        if secret != WEBHOOK_SECRET:
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid secret"
+            )
 
+    data = await request.json()
     update = Update.de_json(
         data,
-        telegram_app.bot,
+        telegram_app.bot
     )
 
-    await telegram_app.process_update(
-        update
+    await telegram_app.process_update(update)
+
+    return {"ok": True}
+
+
+@app.on_event("startup")
+async def startup():
+    global telegram_app
+
+    telegram_app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
     )
 
-    return JSONResponse(
-        {"ok": True}
+    telegram_app.add_handler(
+        CommandHandler("start", start)
     )
+
+    telegram_app.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    telegram_app.add_handler(
+        CommandHandler("search", search_command)
+    )
+
+    telegram_app.add_handler(
+        CommandHandler("stats", stats_command)
+    )
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    render_url = os.getenv(
+        "RENDER_EXTERNAL_URL",
+        ""
+    ).rstrip("/")
+
+    if not render_url:
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL is missing"
+        )
+
+    webhook_url = (
+        f"{render_url}/telegram/webhook"
+    )
+
+    await telegram_app.bot.set_webhook(
+        url=webhook_url,
+        secret_token=WEBHOOK_SECRET or None,
+        drop_pending_updates=True,
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global telegram_app
+
+    if telegram_app:
+        await telegram_app.bot.delete_webhook()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
