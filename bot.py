@@ -35,12 +35,12 @@ running_count = 0
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔎 Sherlock 用户名查询机器人\n\n"
+        "🔎 枪宴 海外用户名查询机器人\n\n"
         "使用方法：\n"
         "/search 用户名\n\n"
         "例如：\n"
-        "/search sherlock\n\n"
-        "查询结果来自 Sherlock。"
+        "/search name\n\n"
+        "查询结果来自 枪宴社工。"
     )
 
 
@@ -175,8 +175,9 @@ async def run_search(update: Update, username: str):
                     text = "没有获得查询结果。"
 
                 header = (
-                    f"🔎 Sherlock 查询结果\n"
+                    f"🔎 查询结果\n"
                     f"👤 用户名：{username}\n\n"
+                    f"官方：@injt8\n"
                 )
 
                 result = header + text
